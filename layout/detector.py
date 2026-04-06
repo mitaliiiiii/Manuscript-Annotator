@@ -7,16 +7,9 @@ class TextDetector:
 
     def detect(self, preprocessed_image):
         """
-        Detects text bounding boxes in a preprocessed (mostly binary) image.
-        Uses contour-based detection and a simplified projection profiling hybrid.
-        
-        :param preprocessed_image: A 2D numpy array (binary/grayscale image)
-        :return: A list of bounding boxes: [x, y, w, h]
+        Detects layout regions in a preprocessed image.
+        Returns a list of dictionaries with 'bbox', 'polygon', 'category_id', and 'area'.
         """
-        # Ensure we have a binary image where text is white and background is black
-        # Depending on adaptive threshold, we might need to invert it based on pixel mass.
-        # Assuming typical output from enhancer: background might be mostly 255.
-        # Let's count white/black pixels to determine if inversion is necessary.
         if preprocessed_image is None or len(preprocessed_image.shape) > 2:
             raise ValueError("Detector requires a 2D binary image.")
 
@@ -24,31 +17,74 @@ class TextDetector:
         num_black = preprocessed_image.size - num_white
         
         if num_white > num_black:
-            # Assuming background is white, text is black -> invert to make text white
             binary_inv = cv2.bitwise_not(preprocessed_image)
         else:
             binary_inv = preprocessed_image
 
-        # Dilation to connect disjoint parts of the same character/word/line
-        # Rectangular kernel tailored for Hindi text lines (horizontal bias)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
+        # Dilation to connect disjoint parts
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
         dilated = cv2.dilate(binary_inv, kernel, iterations=2)
 
-        # Find contours on dilated image
-        contours, hierarchy = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        bounding_boxes = []
+        regions = []
         for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < 100: # Filter small noise
+                continue
+
             x, y, w, h = cv2.boundingRect(contour)
             
-            # Simple heuristic filtering to avoid extreme noise
-            if w > 10 and h > 10 and w < preprocessed_image.shape[1] * 0.95:
-                bounding_boxes.append([int(x), int(y), int(w), int(h)])
+            # Simplify contour to a polygon
+            epsilon = 0.01 * cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+            
+            # Flatten polygon points for COCO [x1, y1, x2, y2, ...]
+            polygon = approx.flatten().tolist()
+            
+            # --- Classification Heuristics ---
+            img_h, img_w = preprocessed_image.shape[:2]
+            aspect_ratio = w / float(h)
+            fill_ratio = area / float(w * h)
+            
+            category_id = 1 # Default: text_region
+            
+            # Heuristic for Marginalia (near edges)
+            margin_threshold = 0.1
+            is_marginal = (x < img_w * margin_threshold or (x + w) > img_w * (1 - margin_threshold))
+            
+            if is_marginal:
+                category_id = 2 # marginalia/notes
+            
+            # Heuristic for Illustration/Diagram
+            is_large_blob = (area > (img_w * img_h) * 0.05) # More than 5% of page
+            is_square_ish = (0.5 < aspect_ratio < 2.0)
+            
+            if is_large_blob or (is_square_ish and area > 1000):
+                category_id = 3 # illustration/diagram
 
-        # Sort bounding boxes top-to-bottom, then left-to-right
-        bounding_boxes = sorted(bounding_boxes, key=lambda b: (b[1], b[0]))
-        
-        return bounding_boxes
+            # Special case: Page Frame (extremely large)
+            if area > (img_w * img_h) * 0.8:
+                category_id = 4 # page_frame
+
+            # Heuristic for Damage/Hole (Category 5)
+            # Irregular, non-horizontal, often "hollow" or strange fill_ratio
+            if not is_marginal and area > 500 and aspect_ratio < 3.0 and fill_ratio < 0.4:
+                 category_id = 5 # damage/hole
+
+            # --- Baseline Extraction (Horizontal Polyline through center) ---
+            # We'll create a 2-point horizontal line through the Y-center for Track 2
+            baseline = [[int(x), int(y + h/2)], [int(x + w), int(y + h/2)]]
+
+            regions.append({
+                "bbox": [int(x), int(y), int(w), int(h)],
+                "polygon": [int(p) for p in polygon],
+                "baseline": baseline,
+                "category_id": category_id,
+                "area": float(area)
+            })
+
+        return regions
     
 if __name__ == '__main__':
     detector = TextDetector()

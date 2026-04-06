@@ -5,77 +5,96 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 
-def visualize_results(image_path, json_path, output_path=None):
+def visualize_coco(coco_path, image_id=None, limit=None, output_dir="outputs/visualized"):
     """
-    Draws bounding boxes and superimposed Hindi text on an image.
-    Uses PIL for robust unicode text rendering (OpenCV lacks native Hindi text support).
+    Visualizes COCO annotations. 
+    If image_id is None, processes all images (up to limit).
     """
-    print(f"Visualizing results for {image_path}...")
+    import json
+    from pathlib import Path
     
-    # Verify inputs
-    if not Path(image_path).exists() or not Path(json_path).exists():
-        print("Image or JSON file not found.")
-        return
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    
+    with open(coco_path, 'r', encoding='utf-8') as f:
+        coco_data = json.load(f)
+    
+    # Filter images to process
+    if image_id is not None:
+        images_to_process = [img for img in coco_data["images"] if img["id"] == image_id]
+    else:
+        images_to_process = coco_data["images"]
 
-    # Load image and JSON
-    img = cv2.imread(str(image_path))
-    if img is None:
-        print("Failed to read image.")
-        return
-        
-    with open(json_path, 'r', encoding='utf-8') as f:
-        results = json.load(f)
+    if limit is not None:
+        images_to_process = images_to_process[:limit]
 
-    # Convert to PIL Image for drawing Unicode text
-    # OpenCV's putText doesn't handle complex scripts perfectly by default
-    img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-    draw = ImageDraw.Draw(img_pil)
+    print(f"Starting batch visualization for {len(images_to_process)} images...")
 
-    # Attempt to load a default font that supports Devanagari
-    # In Windows, Mangal or Nirmala UI are generally available
+    # Load categories for mapping
+    cat_map = {cat["id"]: cat["name"] for cat in coco_data["categories"]}
+
+    # Attempt to load font
     try:
-        # Fallback list of fonts typical on Windows systems
-        font = ImageFont.truetype("Nirmala.ttf", 24)
+        font = ImageFont.truetype("Nirmala.ttf", 20)
     except IOError:
-        try:
-            font = ImageFont.truetype("mangal.ttf", 24)
-        except IOError:
-            print("Warning: Hindi compatible font not found. Text rendering may display blocks.")
-            font = ImageFont.load_default()
+        font = ImageFont.load_default()
 
-    for item in results:
-        bbox = item.get("bbox", [])
-        text = item.get("text", "")
+    for img_info in images_to_process:
+        image_path = img_info["file_name"]
+        curr_id = img_info["id"]
         
-        if len(bbox) == 4:
-            x, y, w, h = bbox
-            
-            # Draw Bounding Box (Red)
-            draw.rectangle([x, y, x + w, y + h], outline=(255, 0, 0), width=3)
-            
-            # Superimpose recognized Hindi text slightly above the bounding box (Blue)
-            # Add a small semi-transparent background to text for readability
-            text_x = x
-            text_y = max(0, y - 30)
-            
-            draw.text((text_x, text_y), text, font=font, fill=(0, 0, 255))
+        if not Path(image_path).exists():
+            print(f"Skipping {image_path}, file not found.")
+            continue
 
-    # Convert back to OpenCV format
-    final_img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+        img = cv2.imread(str(image_path))
+        if img is None:
+            continue
+            
+        img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(img_pil)
 
-    # Determine Output Path
-    if output_path is None:
-        base = Path(image_path)
-        output_path = base.parent / f"{base.stem}_visualized.jpg"
-        
-    cv2.imwrite(str(output_path), final_img)
-    print(f"Visualized image saved to: {output_path}")
+        # Draw annotations for this image
+        page_seq = 1
+        for ann in coco_data["annotations"]:
+            if ann["image_id"] != curr_id:
+                continue
+                
+            # Draw Polygon (Red)
+            for seg in ann["segmentation"]:
+                if len(seg) >= 4:
+                    points = [(seg[i], seg[i+1]) for i in range(0, len(seg), 2)]
+                    draw.polygon(points, outline=(255, 0, 0), width=3)
+                    
+                    # Draw Label + Sequence Order (Reading Order)
+                    label = f"#{page_seq} {cat_map.get(ann['category_id'], 'Unknown')}"
+                    x, y = points[0]
+                    draw.text((x, max(0, y-25)), label, font=font, fill=(0, 0, 255))
+                    page_seq += 1
+                    
+            # Draw Baseline (Green)
+            baseline = ann.get("baseline", [])
+            if baseline and len(baseline) >= 4:
+                # Handle flat list [x1, y1, x2, y2, ...]
+                if isinstance(baseline[0], (int, float)):
+                    line_points = [(baseline[i], baseline[i+1]) for i in range(0, len(baseline), 2)]
+                else:
+                    # Handle list of lists [[x1, y1], [x2, y2]] (back-compat)
+                    line_points = [(p[0], p[1]) for p in baseline]
+                
+                if len(line_points) >= 2:
+                    draw.line(line_points, fill=(0, 255, 0), width=4)
+
+        final_img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+        output_path = Path(output_dir) / f"vis_{Path(image_path).name}"
+        cv2.imwrite(str(output_path), final_img)
+        print(f" - Saved: {output_path.name}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Visualize OCR Pipeline Results")
-    parser.add_argument('image', type=str, help="Path to original image")
-    parser.add_argument('json', type=str, help="Path to JSON results file")
-    parser.add_argument('--out', type=str, help="Optional output path", default=None)
+    parser = argparse.ArgumentParser(description="Visualize COCO Results")
+    parser.add_argument('json', type=str, help="Path to COCO annotations.json")
+    parser.add_argument('--id', type=int, default=None, help="ID of a specific image to visualize")
+    parser.add_argument('--limit', type=int, default=None, help="Max number of images to visualize")
+    parser.add_argument('--out', type=str, default="outputs/visualized", help="Output directory")
     args = parser.parse_args()
     
-    visualize_results(args.image, args.json, args.out)
+    visualize_coco(args.json, image_id=args.id, limit=args.limit, output_dir=args.out)
